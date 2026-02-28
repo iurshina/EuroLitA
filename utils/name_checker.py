@@ -86,7 +86,7 @@ def _build_cache_if_missing() -> None:
     print("Cache built.")
 
 
-_build_cache_if_missing()
+# _build_cache_if_missing()
 
 # Lazy scans (cheap, low RAM)
 forenames_lf = pl.scan_parquet(FORENAMES_PARQUET)
