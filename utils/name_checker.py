@@ -1,9 +1,20 @@
+from __future__ import annotations
+
+import json
 from pathlib import Path
 from typing import Dict, List, Any
 
 import polars as pl
 
 DATA_DIR = Path(__file__).parent.parent / "data"
+CACHE_DIR = Path(__file__).parent.parent / "cache"
+CACHE_DIR.mkdir(exist_ok=True)
+
+FORENAMES_PARQUET = CACHE_DIR / "forenames.parquet"
+SURNAMES_PARQUET  = CACHE_DIR / "surnames.parquet"
+TOTALS_PARQUET    = CACHE_DIR / "totals.parquet"
+GLOBAL_JSON       = CACHE_DIR / "global_totals.json"
+
 
 country_codes_df = pl.read_csv(DATA_DIR / "country_codes.csv")
 country_to_code = dict(zip(country_codes_df["country_name"], country_codes_df["country_code"]))
@@ -18,70 +29,73 @@ def _safe_country_code(claimed_country: str) -> str:
     return cc if len(cc) == 2 else cc[:2]
 
 
-print("Loading name datasets (Polars streaming aggregate)...")
+def _build_cache_if_missing() -> None:
+    """Build Parquet caches once. This is the only heavy step."""
+    if FORENAMES_PARQUET.exists() and SURNAMES_PARQUET.exists() and TOTALS_PARQUET.exists() and GLOBAL_JSON.exists():
+        return
 
-forenames_agg = (
-    pl.scan_csv(
-        DATA_DIR / "forenames_eu.csv",
-        dtypes={"gender": pl.String},
-        low_memory=True,
+    print("Building Parquet cache (one-time)...")
+
+    forenames = (
+        pl.scan_csv(DATA_DIR / "forenames_eu.csv", low_memory=True)
+        .select(
+            pl.col("country").cast(pl.Utf8),
+            pl.col("forename").cast(pl.Utf8).str.to_lowercase().alias("name"),
+            pl.col("count").fill_null(0).cast(pl.Int64),
+        )
+        .group_by(["country", "name"])
+        .agg(pl.col("count").sum().alias("count"))
+        .collect(streaming=True)
     )
-    .select(
-        pl.col("country").cast(pl.Utf8),
-        pl.col("forename").cast(pl.Utf8).str.to_lowercase().alias("name"),
-        pl.col("count").fill_null(0).cast(pl.Int64),
+    forenames.write_parquet(FORENAMES_PARQUET)
+
+    surnames = (
+        pl.concat(
+            [
+                pl.scan_csv(DATA_DIR / "surnames_eu_part1.csv", low_memory=True),
+                pl.scan_csv(DATA_DIR / "surnames_eu_part2.csv", low_memory=True),
+            ],
+            how="vertical_relaxed",
+        )
+        .select(
+            pl.col("country").cast(pl.Utf8),
+            pl.col("surname").cast(pl.Utf8).str.to_lowercase().alias("name"),
+            pl.col("count").fill_null(0).cast(pl.Int64),
+        )
+        .group_by(["country", "name"])
+        .agg(pl.col("count").sum().alias("count"))
+        .collect(streaming=True)
     )
-    .group_by(["country", "name"])
-    .agg(pl.col("count").sum().alias("count"))
-    .collect(streaming=True)
-)
+    surnames.write_parquet(SURNAMES_PARQUET)
 
-surnames_agg = (
-    pl.concat(
-        [
-            pl.scan_csv(
-                DATA_DIR / "surnames_eu_part1.csv",
-                dtypes={"gender": pl.String},
-                low_memory=True,
-            ),
-            pl.scan_csv(
-                DATA_DIR / "surnames_eu_part2.csv",
-                dtypes={"gender": pl.String},
-                low_memory=True,
-            ),
-        ],
-        how="vertical_relaxed",
+    forename_totals = forenames.group_by("country").agg(pl.col("count").sum().alias("total_forenames"))
+    surname_totals = surnames.group_by("country").agg(pl.col("count").sum().alias("total_surnames"))
+
+    totals = (
+        forename_totals.join(surname_totals, on="country", how="inner")
+        .select("country", "total_forenames", "total_surnames")
     )
-    .select(
-        pl.col("country").cast(pl.Utf8),
-        pl.col("surname").cast(pl.Utf8).str.to_lowercase().alias("name"),
-        pl.col("count").fill_null(0).cast(pl.Int64),
-    )
-    .group_by(["country", "name"])
-    .agg(pl.col("count").sum().alias("count"))
-    .collect(streaming=True)
-)
+    totals.write_parquet(TOTALS_PARQUET)
 
-# Totals per country
-forename_totals = forenames_agg.group_by("country").agg(
-    pl.col("count").sum().alias("total_forenames")
-)
+    global_totals = {
+        "GLOBAL_FORENAME_TOTAL": int(forenames["count"].sum()),
+        "GLOBAL_SURNAME_TOTAL": int(surnames["count"].sum()),
+    }
+    GLOBAL_JSON.write_text(json.dumps(global_totals), encoding="utf-8")
 
-surname_totals = surnames_agg.group_by("country").agg(
-    pl.col("count").sum().alias("total_surnames")
-)
+    print("Cache built.")
 
-countries_df = (
-    forename_totals.join(surname_totals, on="country", how="inner")
-    .select("country", "total_forenames", "total_surnames")
-)
 
-# Global totals for baseline ratio
-GLOBAL_FORENAME_TOTAL = int(forenames_agg["count"].sum())
-GLOBAL_SURNAME_TOTAL = int(surnames_agg["count"].sum())
+_build_cache_if_missing()
 
-print(f"Loaded aggregated tables for {countries_df.height} countries.")
-print("Name datasets loaded.")
+# Lazy scans (cheap, low RAM)
+forenames_lf = pl.scan_parquet(FORENAMES_PARQUET)
+surnames_lf = pl.scan_parquet(SURNAMES_PARQUET)
+countries_df = pl.read_parquet(TOTALS_PARQUET)  # small; OK to load
+
+_global = json.loads(GLOBAL_JSON.read_text(encoding="utf-8"))
+GLOBAL_FORENAME_TOTAL = int(_global["GLOBAL_FORENAME_TOTAL"])
+GLOBAL_SURNAME_TOTAL = int(_global["GLOBAL_SURNAME_TOTAL"])
 
 
 def check_plausibility(first: str, last: str, claimed_country: str) -> Dict[str, Any]:
@@ -108,31 +122,19 @@ def check_plausibility(first: str, last: str, claimed_country: str) -> Dict[str,
     first_lower = (first or "").lower().strip()
     last_lower = (last or "").lower().strip()
 
-    if countries_df.height == 0:
-        return {
-            "country": claimed_country,
-            "message": "No country data available.",
-            "plausibility_ratio": 0.0,
-            "plausibility_label": "Unknown",
-            "posterior_share_claimed": 0.0,
-            "claimed_rank": "unknown",
-            "top_country": None,
-            "ranked_countries": [],
-        }
-
     alpha = 0.5
 
-    # Per-country counts
+    # Only read rows where name matches (fast if Parquet + pushdown)
     f_counts = (
-        forenames_agg
-        .filter(pl.col("name") == first_lower)
+        forenames_lf.filter(pl.col("name") == first_lower)
         .select(pl.col("country"), pl.col("count").alias("f_cnt"))
+        .collect()
     )
 
     l_counts = (
-        surnames_agg
-        .filter(pl.col("name") == last_lower)
+        surnames_lf.filter(pl.col("name") == last_lower)
         .select(pl.col("country"), pl.col("count").alias("l_cnt"))
+        .collect()
     )
 
     per_country = (
@@ -153,16 +155,14 @@ def check_plausibility(first: str, last: str, claimed_country: str) -> Dict[str,
     )
 
     joint_sum = float(per_country["joint"].sum()) or 1.0
-    per_country = per_country.with_columns(
-        (pl.col("joint") / joint_sum).alias("posterior_share")
-    )
+    per_country = per_country.with_columns((pl.col("joint") / joint_sum).alias("posterior_share"))
 
-    # Global baseline
+    # Global baseline counts (again: filter pushdown)
     global_first_count = int(
-        forenames_agg.filter(pl.col("name") == first_lower)["count"].sum()
+        forenames_lf.filter(pl.col("name") == first_lower).select(pl.col("count").sum()).collect()[0, 0] or 0
     )
     global_last_count = int(
-        surnames_agg.filter(pl.col("name") == last_lower)["count"].sum()
+        surnames_lf.filter(pl.col("name") == last_lower).select(pl.col("count").sum()).collect()[0, 0] or 0
     )
 
     p_first_global = (global_first_count + alpha) / (GLOBAL_FORENAME_TOTAL + alpha)
@@ -175,7 +175,6 @@ def check_plausibility(first: str, last: str, claimed_country: str) -> Dict[str,
 
     plausibility_ratio = (claimed_joint / p_global_joint) if p_global_joint > 0 else 0.0
 
-    # Label
     if plausibility_ratio < 0.3:
         plaus_label = "Very unusual"
     elif plausibility_ratio < 0.7:
