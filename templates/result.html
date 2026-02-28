@@ -1,50 +1,68 @@
 <div class="alert alert-info shadow-lg mt-6" role="alert">
     <div class="w-full">
+        <!-- Top line: plausibility ratio (FIT metric) -->
         <h3 class="font-bold text-2xl">
-            {{ score }}% Plausible
-            {% if score > 70 %}
-            <span class="badge badge-success ml-2">Approved!</span>
-            {% else %}
-            <span class="badge badge-warning ml-2">Suspicious…</span>
-            {% endif %}
+            {{ plausibility_ratio }}× EU baseline
+            <span class="badge ml-2
+          {% if plausibility_ratio >= 1.5 %} badge-success
+          {% elif plausibility_ratio >= 0.7 %} badge-neutral
+          {% else %} badge-warning
+          {% endif %}
+        ">
+                {{ plausibility_label }}
+            </span>
         </h3>
 
+        <!-- Claimed country summary -->
         <div class="text-lg mt-2">
-            <strong>{{ rarity }}</strong> in {{ country }}.
+            <strong>{{ country }}</strong> fit:
+            <span class="font-mono">{{ plausibility_ratio }}×</span>
+            <span class="opacity-60">(posterior {{ posterior_share_claimed_pct }}%)</span>
+            {% if claimed_rank and claimed_rank != "unknown" %}
+            <span class="opacity-60">·</span>
+            Rank <span class="font-mono">#{{ claimed_rank }}</span>
+            {% endif %}
         </div>
 
         <div class="mt-3 italic opacity-80">{{ message }}</div>
 
-        {% if other_countries and other_countries|length > 0 %}
+        {% if ranked_countries and ranked_countries|length > 0 %}
         <div class="divider my-4"></div>
 
         <div class="mt-2">
-            <div class="font-semibold text-base mb-2">Most common elsewhere</div>
+            <div class="font-semibold text-base mb-2">Top matching countries (posterior share)</div>
 
             <ul class="space-y-2">
-                {% for oc in other_countries %}
+                {% for rc in ranked_countries %}
                 <li class="flex items-center justify-between gap-4">
                     <div class="flex items-center gap-2">
-                        <span class="badge badge-outline">{{ loop.index }}</span>
-                        <span class="font-medium">{{ oc.country }}</span>
+                        <span class="badge badge-outline">{{ rc.rank }}</span>
+
+                        <span class="font-medium {% if rc.is_claimed %} underline decoration-2 {% endif %}">
+                            {{ rc.country }}
+                        </span>
+
+                        {% if rc.is_claimed %}
+                        <span class="badge badge-primary ml-1">Claimed</span>
+                        {% endif %}
                     </div>
 
                     <div class="text-sm opacity-80 text-right whitespace-nowrap">
-                        <span class="font-mono">{{ oc.first_count }}</span> first
+                        <span class="font-mono">{{ rc.first_count }}</span> first
                         <span class="opacity-60">·</span>
-                        <span class="font-mono">{{ oc.last_count }}</span> last
+                        <span class="font-mono">{{ rc.last_count }}</span> last
                         <span class="opacity-60">·</span>
-                        <span class="font-mono">{{ oc.joint_share }}</span>%
+                        <span class="font-mono">{{ rc.posterior_share_pct }}</span>%
                     </div>
                 </li>
                 {% endfor %}
             </ul>
 
-            {% if claimed_rank and claimed_rank != "unknown" %}
             <div class="mt-3 text-sm opacity-70">
-                Claimed country rank: <span class="font-mono">#{{ claimed_rank }}</span>
+                <span class="opacity-80">Tip:</span>
+                “EU baseline” compares how typical the name is in {{ country }} vs all countries pooled.
+                “Posterior share” is used only for ranking countries.
             </div>
-            {% endif %}
         </div>
         {% endif %}
     </div>

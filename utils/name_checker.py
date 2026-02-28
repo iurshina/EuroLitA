@@ -1,229 +1,255 @@
-from collections import defaultdict
 from pathlib import Path
-import pandas as pd
-import math
-from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Any
 
+import polars as pl
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 
-print("Loading name datasets...") 
-
-# Load CSVs
-forenames_df = pd.read_csv(
-    DATA_DIR / "forenames_eu.csv",
-    low_memory=False,
-    dtype={"gender": "string"}
-)
-
-surnames_df = pd.concat([
-    pd.read_csv(DATA_DIR / "surnames_eu_part1.csv", low_memory=False, dtype={"gender": "string"}),
-    pd.read_csv(DATA_DIR / "surnames_eu_part2.csv", low_memory=False, dtype={"gender": "string"})
-], ignore_index=True)
-
-# Load country mapping (full name -> code)
-country_codes_df = pd.read_csv(DATA_DIR / "country_codes.csv")
-# Your mapping uses 'country_name' -> 'country_code' (adjust columns if different)
-country_to_code = dict(zip(country_codes_df['country_name'], country_codes_df['country_code']))
-
-forename_lookup: dict = defaultdict(lambda: defaultdict(int))
-for _, row in forenames_df.iterrows():
-    code = row['country']                     
-    name = str(row['forename']).lower()
-    count = int(row.get('occurrences', row.get('count', 0)))
-    forename_lookup[code][name] += count
-
-surname_lookup: dict = defaultdict(lambda: defaultdict(int))
-for _, row in surnames_df.iterrows():
-    code = row['country']
-    name = str(row['surname']).lower()
-    count = int(row.get('occurrences', row.get('count', 0)))
-    surname_lookup[code][name] += count
-
-print("Name datasets loaded.")
-
+country_codes_df = pl.read_csv(DATA_DIR / "country_codes.csv")
+country_to_code = dict(zip(country_codes_df["country_name"], country_codes_df["country_code"]))
 code_to_country = {v: k for k, v in country_to_code.items()}
 
 
 def _safe_country_code(claimed_country: str) -> str:
-    """Prefer explicit mapping; only accept 2-letter fallback if it *is* a code."""
     claimed_country = (claimed_country or "").strip()
     if claimed_country in country_to_code:
         return country_to_code[claimed_country]
     cc = claimed_country.upper()
-    return cc if len(cc) == 2 else cc[:2] 
+    return cc if len(cc) == 2 else cc[:2]
 
 
-# This is still an approximation: it assumes first/last are independent within a country.
-def check_plausibility(first: str, last: str, claimed_country: str) -> Dict:
+def _count_expr(lf: pl.LazyFrame) -> pl.Expr:
     """
-    Approximate joint probability under independence:
-      score_country ∝ P(first|country) * P(last|country)
-    where P(name|country) is approximated from counts:
-      P(first|c) ≈ f_cnt / total_forenames_in_c
-      P(last|c)  ≈ l_cnt / total_surnames_in_c
+    Some files use 'count' instead of 'occurrences'.
+    Pick whichever exists and normalize to 'count'.
+    """
+    cols = set(lf.collect_schema().names())
+    if "occurrences" in cols:
+        col = "occurrences"
+    elif "count" in cols:
+        col = "count"
+    else:
+        raise ValueError(f"Neither 'occurrences' nor 'count' found. Columns: {sorted(cols)}")
 
-    Returns:
-      - score: 5..95
-      - joint_prob_claimed: normalized joint probability for claimed country
-      - other_countries: top 4 countries by joint probability
+    return pl.col(col).fill_null(0).cast(pl.Int64).alias("count")
+
+
+print("Loading name datasets (Polars streaming aggregate)...")
+
+forenames_lf = pl.scan_csv(
+    DATA_DIR / "forenames_eu.csv",
+    dtypes={"gender": pl.String},
+    low_memory=True,
+)
+
+forenames_agg = (
+    forenames_lf.select(
+        pl.col("country").cast(pl.Utf8),
+        pl.col("forename").cast(pl.Utf8).str.to_lowercase().alias("name"),
+        _count_expr(forenames_lf),
+    )
+    .group_by(["country", "name"])
+    .agg(pl.col("count").sum().alias("count"))
+    .collect(streaming=True)
+)
+
+surnames_lf_1 = pl.scan_csv(
+    DATA_DIR / "surnames_eu_part1.csv",
+    dtypes={"gender": pl.String},
+    low_memory=True,
+)
+surnames_lf_2 = pl.scan_csv(
+    DATA_DIR / "surnames_eu_part2.csv",
+    dtypes={"gender": pl.String},
+    low_memory=True,
+)
+
+surnames_lf = pl.concat([surnames_lf_1, surnames_lf_2], how="vertical_relaxed")
+
+# assume same schema in both surname parts; take count column from part1
+count_expr_surnames = _count_expr(surnames_lf_1)
+
+surnames_agg = (
+    surnames_lf.select(
+        pl.col("country").cast(pl.Utf8),
+        pl.col("surname").cast(pl.Utf8).str.to_lowercase().alias("name"),
+        count_expr_surnames,
+    )
+    .group_by(["country", "name"])
+    .agg(pl.col("count").sum().alias("count"))
+    .collect(streaming=True)
+)
+
+# Totals by country (small)
+forename_totals = forenames_agg.group_by("country").agg(pl.col("count").sum().alias("total_forenames"))
+surname_totals = surnames_agg.group_by("country").agg(pl.col("count").sum().alias("total_surnames"))
+
+countries_df = (
+    forename_totals.join(surname_totals, on="country", how="inner")
+    .select("country", "total_forenames", "total_surnames")
+)
+
+# Global totals (for baseline plausibility ratio)
+GLOBAL_FORENAME_TOTAL = int(forenames_agg["count"].sum())
+GLOBAL_SURNAME_TOTAL = int(surnames_agg["count"].sum())
+
+print(f"Loaded aggregated tables for {countries_df.height} countries.")
+print("Name datasets loaded.")
+
+
+def check_plausibility(first: str, last: str, claimed_country: str) -> Dict[str, Any]:
+    """
+    Returns BOTH:
+      1) plausibility_ratio: how typical the name pair is in claimed country vs EU baseline (ratio)
+      2) posterior ranking list: normalized share across countries (sums to 1), plus rank
+
+    Notes:
+      - 'posterior_share' is a normalized share across countries, not a real demographic probability.
+      - 'plausibility_ratio' answers “does it fit Germany?” better than posterior_share does.
     """
     code = _safe_country_code(claimed_country)
-
     first_lower = (first or "").lower().strip()
     last_lower = (last or "").lower().strip()
 
-    # Countries present in both datasets
-    countries = sorted(set(forename_lookup) & set(surname_lookup))
-
-    if not countries:
+    if countries_df.height == 0:
         return {
-            "score": 5,
-            "rarity": "Unknown",
             "country": claimed_country,
-            "message": "No country data loaded — cannot assess plausibility.",
-            "other_countries": [],
+            "claimed_code": code,
+            "message": "No country data available.",
+            "plausibility_ratio": 0.0,
+            "plausibility_label": "Unknown",
+            "posterior_share_claimed": 0.0,
+            "claimed_rank": "unknown",
+            "top_country": None,
+            "ranked_countries": [],
         }
 
-    # Precompute denominators (total counts) per country
-    # NOTE: this assumes forename/surname tables are within-country occurrence counts
-    total_forenames_by_country = {
-        c: sum(forename_lookup[c].values()) for c in countries
-    }
-    total_surnames_by_country = {
-        c: sum(surname_lookup[c].values()) for c in countries
-    }
+    alpha = 0.5  # smoothing
 
-    # Small smoothing to avoid zero-prob collapse when one side is missing
-    # (0 means "no smoothing")
-    alpha_f = 1.0
-    alpha_l = 1.0
+    # Per-country counts for this query
+    f_counts = (
+        forenames_agg.filter(pl.col("name") == first_lower)
+        .select(pl.col("country"), pl.col("count").alias("f_cnt"))
+    )
+    l_counts = (
+        surnames_agg.filter(pl.col("name") == last_lower)
+        .select(pl.col("country"), pl.col("count").alias("l_cnt"))
+    )
 
-    # Compute joint probability per country
-    # joint(c) = P(first|c) * P(last|c)
-    joint_by_country: List[Tuple[str, float, int, int]] = []
-    for c in countries:
-        f_cnt = forename_lookup[c].get(first_lower, 0)
-        l_cnt = surname_lookup[c].get(last_lower, 0)
+    per_country = (
+        countries_df.join(f_counts, on="country", how="left")
+        .join(l_counts, on="country", how="left")
+        .with_columns(
+            pl.col("f_cnt").fill_null(0),
+            pl.col("l_cnt").fill_null(0),
+        )
+        .with_columns(
+            ((pl.col("f_cnt") + alpha) / (pl.col("total_forenames") + alpha)).alias("p_first"),
+            ((pl.col("l_cnt") + alpha) / (pl.col("total_surnames") + alpha)).alias("p_last"),
+        )
+        .with_columns((pl.col("p_first") * pl.col("p_last")).alias("joint"))
+        .select("country", "joint", "f_cnt", "l_cnt")
+        .sort("joint", descending=True)
+    )
 
-        denom_f = total_forenames_by_country.get(c, 0)
-        denom_l = total_surnames_by_country.get(c, 0)
-
-        if denom_f <= 0 or denom_l <= 0:
-            continue
-
-        # Laplace-style smoothing: (cnt + alpha) / (denom + alpha*V)
-        # We don't know V (vocab size), so we do a light approximation:
-        # use denom + alpha (keeps smoothing gentle and bounded).
-        p_first = (f_cnt + alpha_f) / (denom_f + alpha_f)
-        p_last = (l_cnt + alpha_l) / (denom_l + alpha_l)
-
-        joint = p_first * p_last
-
-        # Keep countries even if counts are zero on one side: smoothing makes them >0,
-        # but they will be tiny and rank low.
-        joint_by_country.append((c, joint, f_cnt, l_cnt))
-
-    if not joint_by_country:
+    # If everything is empty (shouldn't happen with smoothing, but keep safe)
+    if per_country.height == 0:
         return {
-            "score": 5,
-            "rarity": "Non-existent",
             "country": claimed_country,
-            "message": "This name appears nowhere in the European dataset.",
-            "other_countries": [],
+            "claimed_code": code,
+            "message": "No matching data for this name combination.",
+            "plausibility_ratio": 0.0,
+            "plausibility_label": "Unknown",
+            "posterior_share_claimed": 0.0,
+            "claimed_rank": "unknown",
+            "top_country": None,
+            "ranked_countries": [],
         }
 
-    # Rank by joint probability (descending)
-    joint_by_country.sort(key=lambda x: x[1], reverse=True)
+    # "Posterior" shares across countries (normalize joint to sum 1)
+    joint_sum = float(per_country["joint"].sum()) or 1.0
+    per_country = per_country.with_columns((pl.col("joint") / joint_sum).alias("posterior_share"))
 
-    # Normalize joint probabilities across countries so they sum to 1
-    joint_sum = sum(j for _, j, _, _ in joint_by_country) or 1.0
-    joint_norm = {c: (j / joint_sum) for c, j, _, _ in joint_by_country}
+    # Global baseline probabilities for plausibility ratio
+    global_first_count = int(
+        forenames_agg.filter(pl.col("name") == first_lower)["count"].sum()
+    )
+    global_last_count = int(
+        surnames_agg.filter(pl.col("name") == last_lower)["count"].sum()
+    )
 
-    # Claimed country stats
-    f_count_claimed = forename_lookup.get(code, {}).get(first_lower, 0)
-    l_count_claimed = surname_lookup.get(code, {}).get(last_lower, 0)
-    joint_prob_claimed = joint_norm.get(code, 0.0)
+    p_first_global = (global_first_count + alpha) / (GLOBAL_FORENAME_TOTAL + alpha)
+    p_last_global = (global_last_count + alpha) / (GLOBAL_SURNAME_TOTAL + alpha)
+    p_global_joint = p_first_global * p_last_global
 
-    # Claimed rank (1-indexed), if present in ranking list
-    claimed_rank = None
-    for i, (c, _, _, _) in enumerate(joint_by_country):
-        if c == code:
-            claimed_rank = i + 1
-            break
+    # Claimed country row
+    claimed_row = per_country.filter(pl.col("country") == code)
+    claimed_joint = float(claimed_row["joint"][0]) if claimed_row.height else 0.0
+    posterior_share_claimed = float(claimed_row["posterior_share"][0]) if claimed_row.height else 0.0
+    f_count_claimed = int(claimed_row["f_cnt"][0]) if claimed_row.height else 0
+    l_count_claimed = int(claimed_row["l_cnt"][0]) if claimed_row.height else 0
 
-    # Top country joint mass (for suspicion comparisons)
-    top_country, _, _, _ = joint_by_country[0]
-    top_joint_norm = joint_norm.get(top_country, 0.0)
+    plausibility_ratio = (claimed_joint / p_global_joint) if p_global_joint > 0 else 0.0
 
-    # Scoring based on normalized joint probability
-    # Use log scale because joint probs are tiny.
-    # score increases with joint_prob_claimed, and also with closeness to the top country.
-    eps = 1e-18
-    logp = math.log10(joint_prob_claimed + eps)  # ~ negative
-    # Map logp from [-18, -2] roughly into [5, 80]
-    base = 5 + 75 * ((logp + 18) / 16)
-    base = max(5, min(80, base))
-
-    # Bonus for being close to top country's joint probability
-    rel_to_top = (joint_prob_claimed / top_joint_norm) if top_joint_norm > 0 else 0.0
-    rel_bonus = 15 * (rel_to_top ** 0.8)
-
-    score = int(base + rel_bonus)
-    score = max(5, min(95, score))
-
-    # Rarity/message based on joint share
-    # joint_prob_claimed is a share across countries, so thresholds are small.
-    if joint_prob_claimed <= 0:
-        rarity = "Non-existent here"
-        message = f"No evidence for this name pairing in {claimed_country} (by joint estimate)."
-        score = min(score, 10)
-    elif joint_prob_claimed < 0.005:
-        rarity = "Very Rare"
-        message = f"Very low joint plausibility in {claimed_country}."
-    elif joint_prob_claimed < 0.03:
-        rarity = "Rare"
-        message = f"Low joint plausibility in {claimed_country}."
-    elif joint_prob_claimed < 0.10:
-        rarity = "Uncommon"
-        message = f"Moderate joint plausibility in {claimed_country}."
+    # Friendly label for plausibility ratio
+    if plausibility_ratio <= 0:
+        plaus_label = "Unknown"
+    elif plausibility_ratio < 0.3:
+        plaus_label = "Very unusual"
+    elif plausibility_ratio < 0.7:
+        plaus_label = "Unusual"
+    elif plausibility_ratio < 1.5:
+        plaus_label = "Neutral"
+    elif plausibility_ratio < 3.0:
+        plaus_label = "Typical"
     else:
-        rarity = "Common"
-        message = f"High joint plausibility in {claimed_country}."
+        plaus_label = "Very typical"
 
-    # Add concrete counts too (helps debugging/UX)
-    message += f" (first={f_count_claimed}, last={l_count_claimed})"
+    # Rank of claimed (1-based) in the posterior ordering
+    claimed_rank = "unknown"
+    countries_sorted = per_country["country"].to_list()
+    if code in countries_sorted:
+        claimed_rank = countries_sorted.index(code) + 1
 
-    # Suspicion: if another country dominates the joint probability
-    if top_country != code and top_joint_norm > joint_prob_claimed * 4 and top_joint_norm > 0.05:
-        message += " This pairing is much more plausible in other European countries."
-        score = max(5, score - 25)
+    top_country_code = per_country["country"][0]
+    top_country = code_to_country.get(top_country_code, top_country_code)
 
-    if claimed_rank and claimed_rank > 3:
-        message += f" It ranks only #{claimed_rank} by joint plausibility."
+    # Ranked list INCLUDING claimed country (top N)
+    TOP_N = 8
+    ranked_countries: List[Dict[str, Any]] = []
+    for i, row in enumerate(per_country.head(TOP_N).iter_rows(named=True), start=1):
+        ranked_countries.append(
+            {
+                "rank": i,
+                "country": code_to_country.get(row["country"], row["country"]),
+                "code": row["country"],
+                "posterior_share_pct": round(100 * float(row["posterior_share"]), 2),
+                "first_count": int(row["f_cnt"]),
+                "last_count": int(row["l_cnt"]),
+                "is_claimed": (row["country"] == code),
+            }
+        )
 
-    # Other countries (top 4 excluding claimed)
-    other_countries: List[Dict] = []
-    for c, j, f_cnt, l_cnt in joint_by_country:
-        if c == code:
-            continue
-        if len(other_countries) >= 4:
-            break
-        other_countries.append({
-            "country": code_to_country.get(c, c),
-            "joint_share": round(100 * joint_norm.get(c, 0.0), 2),  # percent of joint mass
-            "first_count": f_cnt,
-            "last_count": l_cnt,
-        })
+    message = (
+        f"{claimed_country}: plausibility {plausibility_ratio:.2f}× EU baseline ({plaus_label}). "
+        f"Posterior share {100*posterior_share_claimed:.2f}%."
+        f" (first={f_count_claimed:,}, last={l_count_claimed:,})"
+    )
 
     return {
-        "score": score,
-        "rarity": rarity,
         "country": claimed_country,
-        "message": message.strip(),
-        "other_countries": other_countries,
-        "claimed_rank": claimed_rank or "unknown",
-        "top_country": code_to_country.get(top_country, top_country),
-        "joint_prob_claimed": joint_prob_claimed,  # 0..1
+        "claimed_code": code,
+        "message": message,
+        # Fit metric (use this as your main “plausibility”)
+        "plausibility_ratio": round(plausibility_ratio, 3),
+        "plausibility_label": plaus_label,
+        # Ranking metric (use this for the full list)
+        "posterior_share_claimed": round(posterior_share_claimed, 6),
+        "posterior_share_claimed_pct": round(100 * posterior_share_claimed, 2),
+        "claimed_rank": claimed_rank,
+        "top_country": top_country,
+        "ranked_countries": ranked_countries,
+        # keep these for debugging/inspection
+        "counts_claimed": {"first": f_count_claimed, "last": l_count_claimed},
+        "global_counts": {"first": global_first_count, "last": global_last_count},
     }
