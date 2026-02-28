@@ -15,7 +15,6 @@ SURNAMES_PARQUET = CACHE_DIR / "surnames.parquet"
 TOTALS_PARQUET = CACHE_DIR / "totals.parquet"
 GLOBAL_JSON = CACHE_DIR / "global_totals.json"
 
-# --- Country code mapping ---
 country_codes_df = pl.read_csv(DATA_DIR / "country_codes.csv")
 country_to_code = dict(zip(country_codes_df["country_name"], country_codes_df["country_code"]))
 code_to_country = {v: k for k, v in country_to_code.items()}
@@ -29,6 +28,7 @@ def _safe_country_code(claimed_country: str) -> str:
     return cc if len(cc) == 2 else cc[:2]
 
 
+# The goal was to fit into 512 MB RAM :)
 def _build_cache_if_missing() -> None:
     """
     Build Parquet caches once. This is the only heavy step.
