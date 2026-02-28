@@ -11,11 +11,11 @@ CACHE_DIR = Path(__file__).parent.parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
 FORENAMES_PARQUET = CACHE_DIR / "forenames.parquet"
-SURNAMES_PARQUET  = CACHE_DIR / "surnames.parquet"
-TOTALS_PARQUET    = CACHE_DIR / "totals.parquet"
-GLOBAL_JSON       = CACHE_DIR / "global_totals.json"
+SURNAMES_PARQUET = CACHE_DIR / "surnames.parquet"
+TOTALS_PARQUET = CACHE_DIR / "totals.parquet"
+GLOBAL_JSON = CACHE_DIR / "global_totals.json"
 
-
+# --- Country code mapping ---
 country_codes_df = pl.read_csv(DATA_DIR / "country_codes.csv")
 country_to_code = dict(zip(country_codes_df["country_name"], country_codes_df["country_code"]))
 code_to_country = {v: k for k, v in country_to_code.items()}
@@ -30,8 +30,16 @@ def _safe_country_code(claimed_country: str) -> str:
 
 
 def _build_cache_if_missing() -> None:
-    """Build Parquet caches once. This is the only heavy step."""
-    if FORENAMES_PARQUET.exists() and SURNAMES_PARQUET.exists() and TOTALS_PARQUET.exists() and GLOBAL_JSON.exists():
+    """
+    Build Parquet caches once. This is the only heavy step.
+    Also computes vocabulary sizes needed for proper Laplace smoothing.
+    """
+    if (
+        FORENAMES_PARQUET.exists()
+        and SURNAMES_PARQUET.exists()
+        and TOTALS_PARQUET.exists()
+        and GLOBAL_JSON.exists()
+    ):
         return
 
     print("Building Parquet cache (one-time)...")
@@ -77,9 +85,15 @@ def _build_cache_if_missing() -> None:
     )
     totals.write_parquet(TOTALS_PARQUET)
 
+    # Vocabulary sizes (unique name strings) for correct Laplace/additive smoothing
+    V_FORENAMES = int(forenames.select(pl.col("name").n_unique()).item())
+    V_SURNAMES = int(surnames.select(pl.col("name").n_unique()).item())
+
     global_totals = {
         "GLOBAL_FORENAME_TOTAL": int(forenames["count"].sum()),
         "GLOBAL_SURNAME_TOTAL": int(surnames["count"].sum()),
+        "V_FORENAMES": V_FORENAMES,
+        "V_SURNAMES": V_SURNAMES,
     }
     GLOBAL_JSON.write_text(json.dumps(global_totals), encoding="utf-8")
 
@@ -96,14 +110,15 @@ countries_df = pl.read_parquet(TOTALS_PARQUET)  # small; OK to load
 _global = json.loads(GLOBAL_JSON.read_text(encoding="utf-8"))
 GLOBAL_FORENAME_TOTAL = int(_global["GLOBAL_FORENAME_TOTAL"])
 GLOBAL_SURNAME_TOTAL = int(_global["GLOBAL_SURNAME_TOTAL"])
+V_FORENAMES = int(_global["V_FORENAMES"])
+V_SURNAMES = int(_global["V_SURNAMES"])
 
 
 def check_plausibility(first: str, last: str, claimed_country: str) -> Dict[str, Any]:
     """
     Evaluate how plausible a first+last name pairing is for a claimed country.
 
-    Returns two metrics:
-
+    Returns:
     1) plausibility_ratio:
        Likelihood of the name pairing in the claimed country
        relative to the Europe-wide baseline.
@@ -115,8 +130,9 @@ def check_plausibility(first: str, last: str, claimed_country: str) -> Dict[str,
 
     Notes:
     - First and last names are assumed independent given country.
-    - Uses Laplace smoothing (alpha=0.5).
-    - posterior_share is a ranking signal, not a real-world probability.
+    - Uses proper additive (Laplace) smoothing with vocabulary size.
+    - Additionally, countries with (0 first AND 0 last) are prevented
+      from ranking highly (joint set to 0) to avoid “small country wins”.
     """
     code = _safe_country_code(claimed_country)
     first_lower = (first or "").lower().strip()
@@ -145,11 +161,19 @@ def check_plausibility(first: str, last: str, claimed_country: str) -> Dict[str,
             pl.col("f_cnt").fill_null(0),
             pl.col("l_cnt").fill_null(0),
         )
+        # Proper additive smoothing: denom includes alpha * V
         .with_columns(
-            ((pl.col("f_cnt") + alpha) / (pl.col("total_forenames") + alpha)).alias("p_first"),
-            ((pl.col("l_cnt") + alpha) / (pl.col("total_surnames") + alpha)).alias("p_last"),
+            ((pl.col("f_cnt") + alpha) / (pl.col("total_forenames") + alpha * V_FORENAMES)).alias("p_first"),
+            ((pl.col("l_cnt") + alpha) / (pl.col("total_surnames") + alpha * V_SURNAMES)).alias("p_last"),
         )
-        .with_columns((pl.col("p_first") * pl.col("p_last")).alias("joint"))
+        .with_columns((pl.col("p_first") * pl.col("p_last")).alias("joint_raw"))
+        # Guardrail: if both counts are 0, treat as "no evidence" => joint = 0
+        .with_columns(
+            pl.when((pl.col("f_cnt") == 0) & (pl.col("l_cnt") == 0))
+            .then(0.0)
+            .otherwise(pl.col("joint_raw"))
+            .alias("joint")
+        )
         .select("country", "joint", "f_cnt", "l_cnt")
         .sort("joint", descending=True)
     )
@@ -165,8 +189,9 @@ def check_plausibility(first: str, last: str, claimed_country: str) -> Dict[str,
         surnames_lf.filter(pl.col("name") == last_lower).select(pl.col("count").sum()).collect()[0, 0] or 0
     )
 
-    p_first_global = (global_first_count + alpha) / (GLOBAL_FORENAME_TOTAL + alpha)
-    p_last_global = (global_last_count + alpha) / (GLOBAL_SURNAME_TOTAL + alpha)
+    # Proper smoothing for global too
+    p_first_global = (global_first_count + alpha) / (GLOBAL_FORENAME_TOTAL + alpha * V_FORENAMES)
+    p_last_global = (global_last_count + alpha) / (GLOBAL_SURNAME_TOTAL + alpha * V_SURNAMES)
     p_global_joint = p_first_global * p_last_global
 
     claimed_row = per_country.filter(pl.col("country") == code)
