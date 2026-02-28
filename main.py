@@ -8,6 +8,11 @@ app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
 
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse(

@@ -30,9 +30,11 @@
                     </div>
 
                     <div class="text-sm opacity-80 text-right whitespace-nowrap">
-                        <span class="font-mono">{{ oc.occurrences }}</span> occurrences
+                        <span class="font-mono">{{ oc.first_count }}</span> first
                         <span class="opacity-60">·</span>
-                        <span class="font-mono">{{ oc.percent_of_total }}%</span>
+                        <span class="font-mono">{{ oc.last_count }}</span> last
+                        <span class="opacity-60">·</span>
+                        <span class="font-mono">{{ oc.joint_share }}</span>%
                     </div>
                 </li>
                 {% endfor %}
