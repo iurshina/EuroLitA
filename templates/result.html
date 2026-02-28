@@ -1,0 +1,16 @@
+<div class="alert alert-info shadow-lg mt-6" role="alert">
+    <div class="w-full">
+        <h3 class="font-bold text-2xl">
+            {{ score }}% Euro-Plausible
+            {% if score > 70 %}
+            <span class="badge badge-success ml-2">Approved!</span>
+            {% else %}
+            <span class="badge badge-warning ml-2">Suspicious…</span>
+            {% endif %}
+        </h3>
+        <div class="text-lg mt-2">
+            <strong>{{ rarity }}</strong> in {{ country }}.
+        </div>
+        <div class="mt-3 italic opacity-80">{{ message }}</div>
+    </div>
+</div>

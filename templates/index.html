@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+
+{% block content %}
+<header class="text-center py-10">
+    <h1 class="text-5xl font-bold text-indigo-400">EuroLitA</h1>
+    <p class="mt-3 text-lg opacity-80">Are you really from where you say you are? 😏</p>
+</header>
+
+<form hx-post="/check" hx-target="#result" hx-swap="innerHTML" hx-indicator="#loading"
+    class="space-y-6 bg-slate-900 p-8 rounded-xl border border-slate-700 shadow-2xl">
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <label class="form-control">
+            <span class="label-text text-slate-300">First name</span>
+            <input type="text" name="first_name" placeholder="Anna" required
+                class="input input-bordered w-full bg-slate-800 text-white placeholder-slate-500 focus:border-indigo-500">
+        </label>
+        <label class="form-control">
+            <span class="label-text text-slate-300">Last name</span>
+            <input type="text" name="last_name" placeholder="Schmidt" required
+                class="input input-bordered w-full bg-slate-800 text-white placeholder-slate-500 focus:border-indigo-500">
+        </label>
+    </div>
+
+    <label class="form-control">
+        <span class="label-text text-slate-300">Claimed country</span>
+        <select name="country" required
+            class="select select-bordered w-full bg-slate-800 text-white focus:border-indigo-500">
+            <option value="" disabled selected>Choose origin…</option>
+            <option value="Germany">Germany</option>
+            <option value="France">France</option>
+            <option value="Poland">Poland</option>
+            <!-- add your full list -->
+        </select>
+    </label>
+
+    <button type="submit" class="btn btn-primary w-full text-lg">Check Plausibility</button>
+</form>
+
+<div id="result" class="mt-10"></div>
+<div id="loading" class="htmx-indicator text-center mt-4 opacity-0 transition-opacity">
+    <span class="loading loading-spinner loading-lg text-indigo-400"></span>
+</div>
+{% endblock %}
