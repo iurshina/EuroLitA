@@ -65,10 +65,10 @@ https://www.kaggle.com/datasets/erpel1/forenames-and-surnames-with-gender-and-co
 
 The dataset includes:
 
-First names
-Surnames
-Gender (for forenames)
-Associated country labels
+* First names
+* Surnames
+* Gender (for forenames)
+* Associated country labels
 
 ⚠️ Important:
 This dataset is community-compiled and not an official national statistics source. It may contain:
@@ -119,13 +119,7 @@ source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install fastapi uvicorn[standard] jinja2 pandas python-multipart
 ```
 
-## 3️⃣ Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-## 4️⃣ Add data
+## 3️⃣ Add data
 
 Place datasets inside:
 
@@ -136,7 +130,7 @@ Place datasets inside:
     forenames.csv
 ```
 
-## 5️⃣ Run server
+## 4️⃣ Run server
 
 With uv
 
