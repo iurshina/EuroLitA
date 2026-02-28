@@ -8,9 +8,42 @@
             <span class="badge badge-warning ml-2">Suspicious…</span>
             {% endif %}
         </h3>
+
         <div class="text-lg mt-2">
             <strong>{{ rarity }}</strong> in {{ country }}.
         </div>
+
         <div class="mt-3 italic opacity-80">{{ message }}</div>
+
+        {% if other_countries and other_countries|length > 0 %}
+        <div class="divider my-4"></div>
+
+        <div class="mt-2">
+            <div class="font-semibold text-base mb-2">Most common elsewhere</div>
+
+            <ul class="space-y-2">
+                {% for oc in other_countries %}
+                <li class="flex items-center justify-between gap-4">
+                    <div class="flex items-center gap-2">
+                        <span class="badge badge-outline">{{ loop.index }}</span>
+                        <span class="font-medium">{{ oc.country }}</span>
+                    </div>
+
+                    <div class="text-sm opacity-80 text-right whitespace-nowrap">
+                        <span class="font-mono">{{ oc.occurrences }}</span> occurrences
+                        <span class="opacity-60">·</span>
+                        <span class="font-mono">{{ oc.percent_of_total }}%</span>
+                    </div>
+                </li>
+                {% endfor %}
+            </ul>
+
+            {% if claimed_rank and claimed_rank != "unknown" %}
+            <div class="mt-3 text-sm opacity-70">
+                Claimed country rank: <span class="font-mono">#{{ claimed_rank }}</span>
+            </div>
+            {% endif %}
+        </div>
+        {% endif %}
     </div>
 </div>
