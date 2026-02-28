@@ -190,86 +190,110 @@ Statistical presence ≠ origin truth.
 
 # Metrics
 
-### 1️⃣ Plausibility Ratio (Fit vs EU Baseline)
+## 1️⃣ Plausibility Ratio — “Does this name fit this country?”
 
-This answers:
+We approximate:
 
-> “Is this name pairing more typical in the claimed country than in Europe overall?”
+```
+P(first, last | country) ≈ P(first | country) * P(last | country)
+```
 
-We estimate:
+where:
 
-[
-P(first, last \mid country)
-\approx
-P(first \mid country) \times P(last \mid country)
-]
+```
+P(first | country) = (count(first, country) + α) / (total_forenames(country) + α)
 
-using frequency counts from the dataset.
+P(last | country)  = (count(last, country) + α) / (total_surnames(country) + α)
+```
 
-We then compare that to the Europe-wide baseline:
+* `count(first, country)` = frequency of the first name in that country
+* `total_forenames(country)` = total forename counts in that country
+* same logic for surnames
+* `α = 0.5` (Laplace smoothing to avoid zeros)
 
-[
-\text{plausibility ratio}
-=========================
+We then compare this to the Europe-wide baseline:
 
-\frac{P(first,last \mid country)}
-{P(first,last)}
-]
+```
+plausibility_ratio =
+    P(first, last | country)
+    --------------------------------
+    P(first, last)  (EU pooled)
+```
 
-Interpretation:
+### Interpretation
 
-* **> 1.0** → more typical than EU average
-* **≈ 1.0** → neutral
-* **< 1.0** → less typical than EU average
+| Ratio | Meaning                      |
+| ----- | ---------------------------- |
+| > 1.0 | More typical than EU average |
+| ≈ 1.0 | Neutral                      |
+| < 1.0 | Less typical than EU average |
 
-This is the main “plausibility” metric because it avoids penalizing large countries (like Germany) for having large name totals.
+Examples:
 
-### 2️⃣ Posterior Share (Country Ranking)
+* `2.0` → name is 2× more typical in that country than EU average
+* `0.5` → half as typical as EU average
 
-This answers:
+This is the **main plausibility metric**, because it does not penalize large countries for having large total name counts.
 
-> “If we had to guess a country from the name pairing, which fits best?”
+---
 
-We normalize the country likelihoods across all countries:
+## 2️⃣ Posterior Share — “Which country fits best?”
 
-[
-\text{posterior_share}(c)
-=========================
+We compute the same likelihood for every country and normalize:
 
-\frac{P(first,last \mid c)}
-{\sum_{c'} P(first,last \mid c')}
-]
+```
+posterior_share(country) =
+    P(first, last | country)
+    -----------------------------------------
+    sum over all countries P(first, last | c)
+```
 
-This produces a distribution over countries that sums to 1.
+This produces a distribution across countries that sums to 1.
 
-Important:
+### Important
 
 * This is a **relative ranking signal**
-* It is **not a real-world probability**
-* It does not represent % of population
+* It is **not** a real-world probability
+* It does **not** mean "% of population"
+* It simply shows which country fits best among the dataset
+
+A country can:
+
+* Have a high plausibility ratio (good fit)
+* But still rank #3 among all countries
+
+This is not contradictory — the metrics answer different questions.
+
+---
 
 ## Why Two Metrics?
 
-They answer different questions:
+| Metric             | Question it answers                     |
+| ------------------ | --------------------------------------- |
+| Plausibility Ratio | Does this name look typical in Germany? |
+| Posterior Share    | Which country fits best overall?        |
 
-| Metric             | Question                    |
-| ------------------ | --------------------------- |
-| Plausibility Ratio | Does this name fit Germany? |
-| Posterior Share    | Which country fits best?    |
+You need both to avoid misleading interpretations.
 
-A country can be:
-
-* Highly plausible (ratio > 1),
-* But still rank #3 among all countries.
-
-That is not contradictory — they measure different things.
+---
 
 ## Modeling Assumptions
 
 * First and last names are treated as independent given country.
-* Counts are taken directly from the dataset.
-* A small smoothing constant (α = 0.5) prevents zero-probability issues.
-* No population priors are applied (all countries treated equally).
+* Uses Laplace smoothing (α = 0.5).
+* All countries are treated equally (no population priors).
+* Counts reflect the dataset, not necessarily full population distributions.
+
+---
+
+## Performance & Memory Design
+
+* Uses Polars lazy scanning with streaming aggregation.
+* Aggregates `(country, name, count)` tables once at startup.
+* Avoids large Python dictionaries.
+* Query-time computation is lightweight.
+
+Designed to operate within moderate memory constraints (~500MB).
 
 ---
 
