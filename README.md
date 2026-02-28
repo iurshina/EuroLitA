@@ -175,8 +175,6 @@ It is not designed for:
 * Immigration control
 * Profiling
 
----
-
 # Limitations (obvious for us but not for everyone it seems...)
 
 * Incomplete datasets
@@ -187,6 +185,91 @@ It is not designed for:
 * Data freshness issues
 
 Statistical presence ≠ origin truth.
+
+---
+
+# Metrics
+
+### 1️⃣ Plausibility Ratio (Fit vs EU Baseline)
+
+This answers:
+
+> “Is this name pairing more typical in the claimed country than in Europe overall?”
+
+We estimate:
+
+[
+P(first, last \mid country)
+\approx
+P(first \mid country) \times P(last \mid country)
+]
+
+using frequency counts from the dataset.
+
+We then compare that to the Europe-wide baseline:
+
+[
+\text{plausibility ratio}
+=========================
+
+\frac{P(first,last \mid country)}
+{P(first,last)}
+]
+
+Interpretation:
+
+* **> 1.0** → more typical than EU average
+* **≈ 1.0** → neutral
+* **< 1.0** → less typical than EU average
+
+This is the main “plausibility” metric because it avoids penalizing large countries (like Germany) for having large name totals.
+
+### 2️⃣ Posterior Share (Country Ranking)
+
+This answers:
+
+> “If we had to guess a country from the name pairing, which fits best?”
+
+We normalize the country likelihoods across all countries:
+
+[
+\text{posterior_share}(c)
+=========================
+
+\frac{P(first,last \mid c)}
+{\sum_{c'} P(first,last \mid c')}
+]
+
+This produces a distribution over countries that sums to 1.
+
+Important:
+
+* This is a **relative ranking signal**
+* It is **not a real-world probability**
+* It does not represent % of population
+
+## Why Two Metrics?
+
+They answer different questions:
+
+| Metric             | Question                    |
+| ------------------ | --------------------------- |
+| Plausibility Ratio | Does this name fit Germany? |
+| Posterior Share    | Which country fits best?    |
+
+A country can be:
+
+* Highly plausible (ratio > 1),
+* But still rank #3 among all countries.
+
+That is not contradictory — they measure different things.
+
+## Modeling Assumptions
+
+* First and last names are treated as independent given country.
+* Counts are taken directly from the dataset.
+* A small smoothing constant (α = 0.5) prevents zero-probability issues.
+* No population priors are applied (all countries treated equally).
 
 ---
 

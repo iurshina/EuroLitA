@@ -85,6 +85,25 @@ print("Name datasets loaded.")
 
 
 def check_plausibility(first: str, last: str, claimed_country: str) -> Dict[str, Any]:
+    """
+    Evaluate how plausible a first+last name pairing is for a claimed country.
+
+    Returns two metrics:
+
+    1) plausibility_ratio:
+       Likelihood of the name pairing in the claimed country
+       relative to the Europe-wide baseline.
+       >1 means more typical than EU average.
+
+    2) posterior_share:
+       Normalized likelihood across all countries (sums to 1),
+       used for ranking countries.
+
+    Notes:
+    - First and last names are assumed independent given country.
+    - Uses Laplace smoothing (alpha=0.5).
+    - posterior_share is a ranking signal, not a real-world probability.
+    """
     code = _safe_country_code(claimed_country)
     first_lower = (first or "").lower().strip()
     last_lower = (last or "").lower().strip()
