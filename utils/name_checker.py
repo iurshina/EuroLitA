@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Any, Dict, List, Tuple
 
 import polars as pl
 
@@ -14,6 +15,10 @@ FORENAMES_PARQUET = CACHE_DIR / "forenames.parquet"
 SURNAMES_PARQUET = CACHE_DIR / "surnames.parquet"
 TOTALS_PARQUET = CACHE_DIR / "totals.parquet"
 GLOBAL_JSON = CACHE_DIR / "global_totals.json"
+
+# Cache tuples, not DataFrames
+MAX_NAME_CACHE = 12_000          # per-name per-country counts (first OR last)
+MAX_GLOBAL_COUNT_CACHE = 25_000  # global sum for a name
 
 country_codes_df = pl.read_csv(DATA_DIR / "country_codes.csv")
 country_to_code = dict(zip(country_codes_df["country_name"], country_codes_df["country_code"]))
@@ -28,22 +33,36 @@ def _safe_country_code(claimed_country: str) -> str:
     return cc if len(cc) == 2 else cc[:2]
 
 
+def _parquet_has_hash_column(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        cols = pl.scan_parquet(path).columns
+        return "h" in cols and "name" in cols and "country" in cols and "count" in cols
+    except Exception:
+        return False
+
+
 # The goal was to fit into 512 MB RAM :)
 def _build_cache_if_missing() -> None:
     """
     Build Parquet caches once. This is the only heavy step.
-    Also computes vocabulary sizes needed for proper Laplace smoothing.
+    Also computes vocabulary sizes needed for additive smoothing.
+    Includes a u64 hash column 'h' to speed up name lookups.
     """
-    if (
+    caches_exist = (
         FORENAMES_PARQUET.exists()
         and SURNAMES_PARQUET.exists()
         and TOTALS_PARQUET.exists()
         and GLOBAL_JSON.exists()
-    ):
+    )
+    caches_ok = caches_exist and _parquet_has_hash_column(FORENAMES_PARQUET) and _parquet_has_hash_column(SURNAMES_PARQUET)
+    if caches_ok:
         return
 
     print("Building Parquet cache (one-time)...")
 
+    # Forenames
     forenames = (
         pl.scan_csv(DATA_DIR / "forenames_eu.csv", low_memory=True)
         .select(
@@ -51,12 +70,14 @@ def _build_cache_if_missing() -> None:
             pl.col("forename").cast(pl.Utf8).str.to_lowercase().alias("name"),
             pl.col("count").fill_null(0).cast(pl.Int64),
         )
-        .group_by(["country", "name"])
+        .with_columns(pl.col("name").hash().alias("h"))  # u64 hash
+        .group_by(["country", "name", "h"])
         .agg(pl.col("count").sum().alias("count"))
         .collect(streaming=True)
     )
     forenames.write_parquet(FORENAMES_PARQUET)
 
+    # Surnames
     surnames = (
         pl.concat(
             [
@@ -70,22 +91,23 @@ def _build_cache_if_missing() -> None:
             pl.col("surname").cast(pl.Utf8).str.to_lowercase().alias("name"),
             pl.col("count").fill_null(0).cast(pl.Int64),
         )
-        .group_by(["country", "name"])
+        .with_columns(pl.col("name").hash().alias("h"))  # u64 hash
+        .group_by(["country", "name", "h"])
         .agg(pl.col("count").sum().alias("count"))
         .collect(streaming=True)
     )
     surnames.write_parquet(SURNAMES_PARQUET)
 
+    # Totals per country
     forename_totals = forenames.group_by("country").agg(pl.col("count").sum().alias("total_forenames"))
     surname_totals = surnames.group_by("country").agg(pl.col("count").sum().alias("total_surnames"))
-
     totals = (
         forename_totals.join(surname_totals, on="country", how="inner")
         .select("country", "total_forenames", "total_surnames")
     )
     totals.write_parquet(TOTALS_PARQUET)
 
-    # Vocabulary sizes (unique name strings) for correct Laplace/additive smoothing
+    # Vocabulary sizes for proper smoothing
     V_FORENAMES = int(forenames.select(pl.col("name").n_unique()).item())
     V_SURNAMES = int(surnames.select(pl.col("name").n_unique()).item())
 
@@ -100,7 +122,8 @@ def _build_cache_if_missing() -> None:
     print("Cache built.")
 
 
-# _build_cache_if_missing()
+# Build caches once if needed
+_build_cache_if_missing()
 
 # Lazy scans (cheap, low RAM)
 forenames_lf = pl.scan_parquet(FORENAMES_PARQUET)
@@ -112,6 +135,89 @@ GLOBAL_FORENAME_TOTAL = int(_global["GLOBAL_FORENAME_TOTAL"])
 GLOBAL_SURNAME_TOTAL = int(_global["GLOBAL_SURNAME_TOTAL"])
 V_FORENAMES = int(_global["V_FORENAMES"])
 V_SURNAMES = int(_global["V_SURNAMES"])
+
+
+# Hash helper (must match Parquet 'h' computation)
+# Compute it using Polars' hash to match exactly
+def _name_hash_u64(name: str) -> int:
+    return int(pl.Series([name]).hash()[0])
+
+
+# Cache results as Tuple[(country_code, count), ...] rather than DataFrames
+@lru_cache(maxsize=MAX_NAME_CACHE)
+def _forename_counts_tuples(name: str) -> Tuple[Tuple[str, int], ...]:
+    if not name:
+        return tuple()
+    h = _name_hash_u64(name)
+    df = (
+        forenames_lf
+        .filter(pl.col("h") == h)
+        .filter(pl.col("name") == name)  # collision guard
+        .select(pl.col("country"), pl.col("count"))
+        .collect()
+    )
+    if df.is_empty():
+        return tuple()
+    # Keep only tiny Python primitives in cache
+    return tuple((str(c), int(cnt)) for c, cnt in df.iter_rows())
+
+
+@lru_cache(maxsize=MAX_NAME_CACHE)
+def _surname_counts_tuples(name: str) -> Tuple[Tuple[str, int], ...]:
+    if not name:
+        return tuple()
+    h = _name_hash_u64(name)
+    df = (
+        surnames_lf
+        .filter(pl.col("h") == h)
+        .filter(pl.col("name") == name)  # collision guard
+        .select(pl.col("country"), pl.col("count"))
+        .collect()
+    )
+    if df.is_empty():
+        return tuple()
+    return tuple((str(c), int(cnt)) for c, cnt in df.iter_rows())
+
+
+@lru_cache(maxsize=MAX_GLOBAL_COUNT_CACHE)
+def _global_forename_count(name: str) -> int:
+    if not name:
+        return 0
+    h = _name_hash_u64(name)
+    val = (
+        forenames_lf
+        .filter(pl.col("h") == h)
+        .filter(pl.col("name") == name)
+        .select(pl.col("count").sum())
+        .collect()[0, 0]
+    )
+    return int(val or 0)
+
+
+@lru_cache(maxsize=MAX_GLOBAL_COUNT_CACHE)
+def _global_surname_count(name: str) -> int:
+    if not name:
+        return 0
+    h = _name_hash_u64(name)
+    val = (
+        surnames_lf
+        .filter(pl.col("h") == h)
+        .filter(pl.col("name") == name)
+        .select(pl.col("count").sum())
+        .collect()[0, 0]
+    )
+    return int(val or 0)
+
+
+def _tuples_to_df(tuples_: Tuple[Tuple[str, int], ...], col_name: str) -> pl.DataFrame:
+    """
+    Convert cached tuples into a small DataFrame for joining.
+    This allocates per-request but remains small (countries where the name exists).
+    """
+    if not tuples_:
+        return pl.DataFrame({"country": [], col_name: []}, schema={"country": pl.Utf8, col_name: pl.Int64})
+    countries, counts = zip(*tuples_)
+    return pl.DataFrame({"country": list(countries), col_name: list(counts)})
 
 
 def check_plausibility(first: str, last: str, claimed_country: str) -> Dict[str, Any]:
@@ -130,9 +236,8 @@ def check_plausibility(first: str, last: str, claimed_country: str) -> Dict[str,
 
     Notes:
     - First and last names are assumed independent given country.
-    - Uses proper additive (Laplace) smoothing with vocabulary size.
-    - Additionally, countries with (0 first AND 0 last) are prevented
-      from ranking highly (joint set to 0) to avoid “small country wins”.
+    - Uses proper additive smoothing with vocabulary size.
+    - Guardrail: if (0 first AND 0 last) for a country, joint is set to 0.
     """
     code = _safe_country_code(claimed_country)
     first_lower = (first or "").lower().strip()
@@ -140,18 +245,11 @@ def check_plausibility(first: str, last: str, claimed_country: str) -> Dict[str,
 
     alpha = 0.5
 
-    # Only read rows where name matches (fast if Parquet + pushdown)
-    f_counts = (
-        forenames_lf.filter(pl.col("name") == first_lower)
-        .select(pl.col("country"), pl.col("count").alias("f_cnt"))
-        .collect()
-    )
-
-    l_counts = (
-        surnames_lf.filter(pl.col("name") == last_lower)
-        .select(pl.col("country"), pl.col("count").alias("l_cnt"))
-        .collect()
-    )
+    # Cached per-name lookups (A), accelerated by hash (B)
+    f_tuples = _forename_counts_tuples(first_lower)
+    l_tuples = _surname_counts_tuples(last_lower)
+    f_counts = _tuples_to_df(f_tuples, "f_cnt")
+    l_counts = _tuples_to_df(l_tuples, "l_cnt")
 
     per_country = (
         countries_df
@@ -181,13 +279,9 @@ def check_plausibility(first: str, last: str, claimed_country: str) -> Dict[str,
     joint_sum = float(per_country["joint"].sum()) or 1.0
     per_country = per_country.with_columns((pl.col("joint") / joint_sum).alias("posterior_share"))
 
-    # Global baseline counts (again: filter pushdown)
-    global_first_count = int(
-        forenames_lf.filter(pl.col("name") == first_lower).select(pl.col("count").sum()).collect()[0, 0] or 0
-    )
-    global_last_count = int(
-        surnames_lf.filter(pl.col("name") == last_lower).select(pl.col("count").sum()).collect()[0, 0] or 0
-    )
+    # Cached global baseline counts
+    global_first_count = _global_forename_count(first_lower)
+    global_last_count = _global_surname_count(last_lower)
 
     # Proper smoothing for global too
     p_first_global = (global_first_count + alpha) / (GLOBAL_FORENAME_TOTAL + alpha * V_FORENAMES)
