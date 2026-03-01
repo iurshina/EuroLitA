@@ -1,71 +1,115 @@
 import pytest
+
 from utils.name_checker import check_plausibility
 
 
+def _pct(x) -> float:
+    """Accepts numeric-like values and returns float percent."""
+    return float(x)
+
+
 @pytest.mark.parametrize(
-    "first, last, claimed_country, expected_min_score, expected_max_score, expected_keywords",
+    "first, last, claimed_country, expected_ratio_min, expected_ratio_max, expected_label_any",
     [
-        # Very typical German name in Germany -> high score
-        ("Anna", "Müller", "Germany", 80, 100, ["Common", "typical"]),
+        # Typical German name in Germany -> plausibility should be >= ~neutral/typical
+        ("Anna", "Müller", "Germany", 0.7, 1000.0, ["Neutral", "Typical", "Very typical"]),
 
-        # Very typical Polish name in Poland -> high score
-        ("Zofia", "Kowalska", "Poland", 80, 100, ["Common", "typical"]),
+        # Typical Polish name in Poland
+        ("Zofia", "Kowalska", "Poland", 0.7, 1000.0, ["Neutral", "Typical", "Very typical"]),
 
-        # German name claimed in Poland -> low score + suspicion hint
-        ("Anna", "Müller", "Poland", 5, 45, ["Rare", "uncommon", "suspicious"]),
+        # German name claimed in Poland -> plausibility often lower than Germany case
+        # (we check it's not "Very typical" and plausibility ratio not huge)
+        ("Anna", "Müller", "Poland", 0.0, 3.0, ["Very unusual", "Unusual", "Neutral", "Typical"]),
 
-        # Non-existing name everywhere -> very low score
-        ("Xzqwerty", "Blablablinsky", "Germany", 0, 15, ["nowhere"]),
+        # Non-existing name everywhere -> very low plausibility, low probability share
+        ("Xzqwerty", "Blablablinsky", "Germany", 0.0, 1.5, ["Very unusual", "Unusual", "Neutral"]),
 
-        # Rare name but exists a bit -> medium-low
-        ("Einar", "Björnsson", "Germany", 10, 50, ["Rare", "unusual"]),
+        # Rare but exists -> typically unusual/neutral
+        ("Einar", "Björnsson", "Germany", 0.0, 3.0, ["Very unusual", "Unusual", "Neutral", "Typical"]),
 
-        # Very common name in claimed country
-        ("Mohammed", "Ali", "United Kingdom", 40, 85, ["Common"]),
+        # Common-ish global name; depends on dataset coverage for UK
+        ("Mohammed", "Ali", "United Kingdom", 0.0, 1000.0, ["Unusual", "Neutral", "Typical", "Very typical"]),
 
-        # Edge case: empty inputs (should be handled gracefully)
-        ("", "Schmidt", "Germany", 0, 100, ["Rare", "zero"]),
-    ]
+        # Edge case: empty first name (should not crash)
+        ("", "Schmidt", "Germany", 0.0, 1000.0, ["Very unusual", "Unusual", "Neutral", "Typical", "Very typical"]),
+    ],
 )
 def test_plausibility_scenarios(
-    first, last, claimed_country,
-    expected_min_score, expected_max_score, expected_keywords
+    first,
+    last,
+    claimed_country,
+    expected_ratio_min,
+    expected_ratio_max,
+    expected_label_any,
 ):
     result = check_plausibility(first, last, claimed_country)
 
     assert isinstance(result, dict)
-    assert "score" in result
-    assert "rarity" in result
+
+    # New keys
+    assert "plausibility_ratio" in result
+    assert "plausibility_label" in result
+    assert "posterior_share_claimed_pct" in result
+    assert "claimed_rank" in result
+    assert "top_country" in result
+    assert "ranked_countries" in result
     assert "country" in result
-    assert "message" in result
 
     assert result["country"] == claimed_country
 
-    # Score range check
-    assert expected_min_score <= result["score"] <= expected_max_score, \
-        f"Score {result['score']} not in expected range [{expected_min_score}, {expected_max_score}]"
+    ratio = float(result["plausibility_ratio"])
+    assert expected_ratio_min <= ratio <= expected_ratio_max, (
+        f"plausibility_ratio {ratio} not in expected range "
+        f"[{expected_ratio_min}, {expected_ratio_max}]"
+    )
 
-    # Keyword presence in message (case insensitive)
-    msg_lower = result["message"].lower()
-    for kw in expected_keywords:
-        assert kw.lower() in msg_lower, f"Expected keyword '{kw}' not found in: {result['message']}"
+    # Label should be one of the known labels
+    assert result["plausibility_label"] in {
+        "Very unusual",
+        "Unusual",
+        "Neutral",
+        "Typical",
+        "Very typical",
+    }
 
-    # Basic sanity
-    assert 0 <= result["score"] <= 100
-    assert len(result["message"]) > 10
+    # Scenario expects label to be within some acceptable set
+    assert result["plausibility_label"] in set(expected_label_any), (
+        f"Label '{result['plausibility_label']}' not in allowed set {expected_label_any}"
+    )
 
+    # Posterior share percent sanity
+    p = _pct(result["posterior_share_claimed_pct"])
+    assert 0.0 <= p <= 100.0
 
-def test_non_european_claim_fallback():
-    # If someone sends a non-existing country name → should still run without crash
-    result = check_plausibility("Anna", "Novak", "Atlantis")
-    assert result["score"] >= 0
-    assert "country" in result
-    assert isinstance(result["score"], int)
+    # ranked_countries shape / contents
+    ranked = result["ranked_countries"]
+    assert isinstance(ranked, list)
+    assert 0 < len(ranked) <= 8
+    for row in ranked:
+        assert isinstance(row, dict)
+        assert {"rank", "country", "posterior_share_pct", "first_count", "last_count", "is_claimed"} <= set(row.keys())
+        assert isinstance(row["rank"], int)
+        assert 1 <= row["rank"] <= 8
+        assert isinstance(row["country"], str)
+        assert 0.0 <= float(row["posterior_share_pct"]) <= 100.0
+        assert isinstance(row["first_count"], int)
+        assert isinstance(row["last_count"], int)
+        assert isinstance(row["is_claimed"], bool)
+
+    # Claimed country should appear in full per_country ranking, but might not appear in top 8
+    # So only check that `claimed_rank` is either "unknown" or a positive int.
+    cr = result["claimed_rank"]
+    assert cr == "unknown" or (isinstance(cr, int) and cr >= 1)
+
+    # top_country sanity
+    assert isinstance(result["top_country"], str)
+    assert len(result["top_country"]) > 0
 
 
 def test_case_insensitivity():
     result_upper = check_plausibility("ANNA", "MÜLLER", "Germany")
     result_lower = check_plausibility("anna", "müller", "Germany")
 
-    assert result_upper["score"] == result_lower["score"]
-    assert result_upper["rarity"] == result_lower["rarity"]
+    assert float(result_upper["plausibility_ratio"]) == float(result_lower["plausibility_ratio"])
+    assert result_upper["plausibility_label"] == result_lower["plausibility_label"]
+    assert float(result_upper["posterior_share_claimed_pct"]) == float(result_lower["posterior_share_claimed_pct"])

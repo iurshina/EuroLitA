@@ -37,7 +37,7 @@ def _parquet_has_hash_column(path: Path) -> bool:
     if not path.exists():
         return False
     try:
-        cols = pl.scan_parquet(path).columns
+        cols = pl.scan_parquet(path).collect_schema().names()
         return "h" in cols and "name" in cols and "country" in cols and "count" in cols
     except Exception:
         return False
